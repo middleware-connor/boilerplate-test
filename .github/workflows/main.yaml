@@ -1,0 +1,345 @@
+name: CI Workflow
+
+# on:
+#   push:
+#     tags:
+#       - 'v*'
+
+on:
+  push:
+    branches:
+      - master
+
+jobs:
+  build-base-image-and-push:
+    runs-on: ubuntu-20.04
+    steps:
+
+      # Setup & Configurations
+
+      - name: Checkout
+        uses: actions/checkout@v2
+
+      - name: Get package version
+        id: package-version
+        uses: martinbeentjes/npm-get-version-action@v1.3.1
+
+      - name: Set action env
+        run: |
+          echo "DOCKER_IMAGE_NAME=ghcr.io/${{ github.repository }}/base" >> $GITHUB_ENV
+          echo "RELEASE_VERSION=${{ steps.package-version.outputs.current-version }}" >> $GITHUB_ENV
+
+      # Build and Push Docker Image
+
+      - name: Login to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.repository_owner }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Check if image exists
+        id: image-exists
+        run: |
+          if docker pull ${{ env.DOCKER_IMAGE_NAME }}:${{ env.RELEASE_VERSION }}; then
+            echo "Image exists!"
+            echo "IMAGE_EXISTS=true" >> $GITHUB_ENV
+          else
+            echo "Image does not exist."
+            echo "IMAGE_EXISTS=false" >> $GITHUB_ENV
+          fi
+
+      - name: Set up Docker Buildx
+        if: ${{ env.IMAGE_EXISTS == 'false' }}
+        uses: docker/setup-buildx-action@v1
+
+      - name: Build and push
+        if: ${{ env.IMAGE_EXISTS == 'false' }} # 이미지가 없는 경우에만 Build & Push
+        uses: docker/build-push-action@v2
+        with:
+          context: .
+          file: ./docker/base.Dockerfile
+          build-args: GITHUB_TOKEN=${{ secrets.GITHUB_TOKEN }}
+          push: true
+          tags: |
+            ${{ env.DOCKER_IMAGE_NAME }}:${{ env.RELEASE_VERSION }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+    outputs:
+      docker-image-name: ${{ env.DOCKER_IMAGE_NAME }}
+      docker-image-tag: ${{ env.RELEASE_VERSION }}
+
+  # test:
+  #   runs-on: ubuntu-20.04
+  #   needs: [build-base-image-and-push]
+  #   steps:
+
+  #     # Setup & Configurations
+
+  #     - name: Checkout repository
+  #       uses: actions/checkout@v2
+
+  #     - name: Set action env
+  #       run: |
+  #         echo "SOURCE_DOCKER_IMAGE=${{ needs.build-base-image-and-push.outputs.docker-image-name }}:${{ needs.build-base-image-and-push.outputs.docker-image-tag }}" >> $GITHUB_ENV
+
+  #     # Testing
+
+  #     - name: Login to GitHub Container Registry
+  #       uses: docker/login-action@v3
+  #       with:
+  #         registry: ghcr.io
+  #         username: ${{ github.repository_owner }}
+  #         password: ${{ secrets.GITHUB_TOKEN }}
+
+  #     - name: Test
+  #       run: |
+  #         echo "${{ secrets.TEST_ENV_FILE }}" > ./env/.env.local
+  #         docker run --name step-runner --rm -v $(pwd)/env/.env.local:/opt/app/env/.env.local -v $(pwd)/.npmrc:/opt/app/.npmrc ${{ env.SOURCE_DOCKER_IMAGE }} npm run test
+
+  #     - name: Cleanup
+  #       if: always()
+  #       run: |
+  #         docker rm -f step-runner
+
+  build-sdk-and-publish-package:
+    runs-on: ubuntu-20.04
+    needs: [build-base-image-and-push]
+    steps:
+
+      # Setup & Configurations
+
+      - name: Checkout repository
+        uses: actions/checkout@v2
+
+      - name: Get package info
+        id: package-info
+        uses: luizfelipelaviola/get-package-info@v1
+        with:
+          path: .
+
+      - name: Set action env
+        run: |
+          echo "NPM_PACKAGE_NAME=${{ steps.package-info.outputs.name }}-sdk" >> $GITHUB_ENV
+          echo "RELEASE_VERSION=${{ steps.package-info.outputs.version }}" >> $GITHUB_ENV
+          echo "SOURCE_DOCKER_IMAGE=${{ needs.build-base-image-and-push.outputs.docker-image-name }}:${{ needs.build-base-image-and-push.outputs.docker-image-tag }}" >> $GITHUB_ENV
+
+      - name: Add configuration files
+        run: |
+          echo "${{ secrets.TEST_ENV_FILE }}" > ./env/.env.local 
+          echo "@torderdev:registry=https://npm.pkg.github.com/" > .npmrc
+          echo "//npm.pkg.github.com/:_authToken=${{ secrets.GITHUB_TOKEN }}" >> .npmrc
+
+      # Publishing NPM Package
+
+      - name: Check if package exists
+        id: package-exists
+        run: |
+          if npm info ${{ env.NPM_PACKAGE_NAME }}@${{ env.RELEASE_VERSION }}; then
+            echo "Package exists!"
+            echo "PACKAGE_EXISTS=true" >> $GITHUB_ENV
+          else
+            echo "Package does not exist."
+            echo "PACKAGE_EXISTS=false" >> $GITHUB_ENV
+          fi
+
+      - name: Login to GitHub Container Registry
+        if: ${{ env.PACKAGE_EXISTS == 'false' }}
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.repository_owner }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and publish SDK
+        if: ${{ env.PACKAGE_EXISTS == 'false' }} # 패키지가 없는 경우에만 Build & Publish
+        run: |
+          docker run --name step-runner --rm -v $(pwd)/env/.env.local:/opt/app/env/.env.local -v $(pwd)/.npmrc:/opt/app/.npmrc ${{ env.SOURCE_DOCKER_IMAGE }} npm run publish:sdk
+
+      - name: Cleanup
+        if: always()
+        run: |
+          docker rm -f step-runner
+
+  build-swagger-image-and-push:
+    runs-on: ubuntu-20.04
+    needs: [build-base-image-and-push, build-sdk-and-publish-package]
+    steps:
+
+      # Setup & Configurations
+
+      - name: Checkout
+        uses: actions/checkout@v2
+
+      - name: Set action env
+        run: |
+          echo "DOCKER_IMAGE_NAME=ghcr.io/${{ github.repository }}/swagger" >> $GITHUB_ENV
+          echo "RELEASE_VERSION=${{ needs.build-base-image-and-push.outputs.docker-image-tag }}" >> $GITHUB_ENV
+          echo "SOURCE_DOCKER_IMAGE=${{ needs.build-base-image-and-push.outputs.docker-image-name }}:${{ needs.build-base-image-and-push.outputs.docker-image-tag }}" >> $GITHUB_ENV
+
+      # Build and Push Docker Image
+
+      - name: Login to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.repository_owner }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Check if image exists
+        id: image-exists
+        run: |
+          if docker pull ${{ env.DOCKER_IMAGE_NAME }}:${{ env.RELEASE_VERSION }}; then
+            echo "Image exists!"
+            echo "IMAGE_EXISTS=true" >> $GITHUB_ENV
+          else
+            echo "Image does not exist."
+            echo "IMAGE_EXISTS=false" >> $GITHUB_ENV
+          fi
+
+      - name: Generate
+        if: ${{ env.IMAGE_EXISTS == 'false' }}
+        run: |
+          echo "${{ secrets.TEST_ENV_FILE }}" > ./env/.env.local
+          touch ./docs/swagger.json
+          docker run --name step-runner --rm -v $(pwd)/docs/swagger.json:/opt/app/docs/swagger.json -v $(pwd)/env/.env.local:/opt/app/env/.env.local ${{ env.SOURCE_DOCKER_IMAGE }} npm run build:swagger
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v1
+
+      - name: Build and push
+        if: ${{ env.IMAGE_EXISTS == 'false' }} # 이미지가 없는 경우에만 Build & Push
+        uses: docker/build-push-action@v2
+        with:
+          context: .
+          file: ./docker/swagger.Dockerfile
+          push: true
+          tags: |
+            ${{ env.DOCKER_IMAGE_NAME }}:${{ env.RELEASE_VERSION }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Cleanup
+        if: always()
+        run: |
+          docker rm -f step-runner
+
+  build-compodoc-image-and-push:
+    runs-on: ubuntu-20.04
+    needs: [build-base-image-and-push, build-sdk-and-publish-package]
+    steps:
+
+      # Setup & Configurations
+
+      - name: Checkout
+        uses: actions/checkout@v2
+
+      - name: Set action env
+        run: |
+          echo "DOCKER_IMAGE_NAME=ghcr.io/${{ github.repository }}/compodoc" >> $GITHUB_ENV
+          echo "RELEASE_VERSION=${{ needs.build-base-image-and-push.outputs.docker-image-tag }}" >> $GITHUB_ENV
+          echo "SOURCE_DOCKER_IMAGE=${{ needs.build-base-image-and-push.outputs.docker-image-name }}:${{ needs.build-base-image-and-push.outputs.docker-image-tag }}" >> $GITHUB_ENV
+
+      # Build and Push Docker Image
+
+      - name: Login to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.repository_owner }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Check if image exists
+        id: image-exists
+        run: |
+          if docker pull ${{ env.DOCKER_IMAGE_NAME }}:${{ env.RELEASE_VERSION }}; then
+            echo "Image exists!"
+            echo "IMAGE_EXISTS=true" >> $GITHUB_ENV
+          else
+            echo "Image does not exist."
+            echo "IMAGE_EXISTS=false" >> $GITHUB_ENV
+          fi
+
+      - name: Generate
+        if: ${{ env.IMAGE_EXISTS == 'false' }}
+        run: |
+          docker run --name step-runner --rm -v $(pwd)/docs/compodoc:/opt/app/docs/compodoc ${{ env.SOURCE_DOCKER_IMAGE }} npm run build:compodoc
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v1
+
+      - name: Build and push
+        if: ${{ env.IMAGE_EXISTS == 'false' }} # 이미지가 없는 경우에만 Build & Push
+        uses: docker/build-push-action@v2
+        with:
+          context: .
+          file: ./docker/compodoc.Dockerfile
+          push: true
+          tags: |
+            ${{ env.DOCKER_IMAGE_NAME }}:${{ env.RELEASE_VERSION }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Cleanup
+        if: always()
+        run: |
+          docker rm -f step-runner
+
+  build-service-image-and-push:
+    runs-on: ubuntu-20.04
+    needs: [build-base-image-and-push, build-sdk-and-publish-package]
+    steps:
+
+      # Setup & Configurations
+      
+      - name: Checkout
+        uses: actions/checkout@v2
+
+      - name: Set action env
+        run: |
+          echo "DOCKER_IMAGE_NAME=ghcr.io/${{github.repository}}" >> $GITHUB_ENV
+          echo "RELEASE_VERSION=${{ needs.build-base-image-and-push.outputs.docker-image-tag }}" >> $GITHUB_ENV
+
+      # Build and Push Docker Image
+
+      - name: Login to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.repository_owner }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Check if image exists
+        id: image-exists
+        run: |
+          if docker pull ${{ env.DOCKER_IMAGE_NAME }}:${{ env.RELEASE_VERSION }}; then
+            echo "Image exists!"
+            echo "IMAGE_EXISTS=true" >> $GITHUB_ENV
+          else
+            echo "Image does not exist."
+            echo "IMAGE_EXISTS=false" >> $GITHUB_ENV
+          fi
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v1
+
+      - name: Build and push
+        if: ${{ env.IMAGE_EXISTS == 'false' }} # 이미지가 없는 경우에만 Build & Push
+        uses: docker/build-push-action@v2
+        with:
+          context: .
+          file: ./docker/service.Dockerfile
+          build-args: |
+            RELEASE_VERSION=${{ env.RELEASE_VERSION }}
+            GITHUB_TOKEN=${{ secrets.GITHUB_TOKEN }}
+          push: true
+          tags: |
+            ${{ env.DOCKER_IMAGE_NAME }}:${{ env.RELEASE_VERSION }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+    outputs:
+      docker-image-name: ${{ env.DOCKER_IMAGE_NAME }}
+      docker-image-tag: ${{ env.RELEASE_VERSION }}
+
+  
